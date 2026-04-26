@@ -1,0 +1,576 @@
+import java.io.*;
+import java.util.*;
+import java.util.zip.CRC32;
+
+public class Zip {
+
+    // ── constants ─────────────────────────────────────────────────────
+    static final int  Blocksize  = 0xffff;
+    static final int  Maxcap     = 0xffffff - Blocksize - 1;
+    static final long Maxfilesz  = 4_000_000_000L;
+    static final int  MaxFilter  = 4196;
+
+    // file format magic number "ZP2\0"
+    static final int  Magic      = 0x5A503200;
+
+    // token markers in encoded stream
+    // 2-byte token: if == 0xFFFF it means next 4 bytes are a raw block
+    // otherwise it is a dictionary index
+    static final short RawMarker = (short) 0xFFFF;
+
+    // sort results
+    static final byte Morethan = 0;
+    static final byte Equal    = 1;
+    static final byte LessThan = 2;
+
+    // global file size set by readfile
+    static int Filesz = 0;
+
+    // ── AmtEntry ──────────────────────────────────────────────────────
+    static class AmtEntry {
+        int block;
+        int amt;
+
+        AmtEntry(int block, int amt) {
+            this.block = block;
+            this.amt   = amt;
+        }
+
+        AmtEntry copy() { return new AmtEntry(block, amt); }
+    }
+
+    // ── AmtList ───────────────────────────────────────────────────────
+    static class AmtList {
+        int        capacity;
+        int        length;
+        AmtEntry[] data;
+
+        AmtList() {
+            capacity = Blocksize;
+            length   = 0;
+            data     = new AmtEntry[Blocksize];
+        }
+
+        boolean increase() {
+            if (capacity >= Maxcap) return false;
+            int newCap = capacity + Blocksize;
+            data       = Arrays.copyOf(data, newCap);
+            capacity   = newCap;
+            return true;
+        }
+
+        boolean add(AmtEntry e) {
+            if (length == capacity) {
+                if (capacity >= Maxcap) return false;
+                if (!increase())        return false;
+            }
+            data[length++] = e;
+            return true;
+        }
+
+        AmtEntry search(int needle) {
+            if (length == 0) return null;
+            for (int n = 0; n < length; n++)
+                if (data[n].block == needle)
+                    return data[n];
+            return null;
+        }
+
+        AmtList copy() {
+            AmtList neu = new AmtList();
+            if (length == 0) return neu;
+            for (int i = 0; i < length; i++)
+                neu.add(data[i].copy());
+            return neu;
+        }
+
+        boolean eq(AmtList other) {
+            if (other == null)          return false;
+            if (length != other.length) return false;
+            for (int n = 0; n < length; n++)
+                if (data[n].amt   != other.data[n].amt ||
+                    data[n].block != other.data[n].block)
+                    return false;
+            return true;
+        }
+    }
+
+    // ── BlockList ─────────────────────────────────────────────────────
+    static class BlockList {
+        short length;
+        int[] blocks;
+
+        BlockList(int capacity) {
+            length = 0;
+            blocks = new int[capacity];
+        }
+    }
+
+    // ── Dictionary ────────────────────────────────────────────────────
+    // built from BlockList — maps block value → short index
+    static class Dictionary {
+        int[]             blocks;   // index → block value
+        short             size;     // number of entries
+        HashMap<Integer,Short> map; // block value → index (for fast lookup)
+
+        Dictionary(BlockList common) {
+            size   = common.length;
+            blocks = Arrays.copyOf(common.blocks, size);
+            map    = new HashMap<>();
+            for (short i = 0; i < size; i++)
+                map.put(blocks[i], i);
+        }
+
+        // returns index if block is in dictionary, -1 if not
+        int lookup(int block) {
+            Short idx = map.get(block);
+            return (idx == null) ? -1 : (idx & 0xFFFF);
+        }
+    }
+
+    // ── ZipHeader ─────────────────────────────────────────────────────
+    // written at the start of every .zp2 file
+    // layout (14 bytes total):
+    //   magic:     4 bytes
+    //   orig_size: 4 bytes
+    //   dict_size: 2 bytes
+    //   crc32:     4 bytes
+    static class ZipHeader {
+        int   magic;
+        int   origSize;
+        short dictSize;
+        int   crc32;
+
+        static final int SIZE = 14;
+
+        byte[] toBytes() {
+            byte[] b = new byte[SIZE];
+            writeInt(b, 0, magic);
+            writeInt(b, 4, origSize);
+            writeShort(b, 8, dictSize);
+            writeInt(b, 10, crc32);
+            return b;
+        }
+
+        static ZipHeader fromBytes(byte[] b) {
+            ZipHeader h = new ZipHeader();
+            h.magic    = readInt(b, 0);
+            h.origSize = readInt(b, 4);
+            h.dictSize = readShort(b, 8);
+            h.crc32    = readInt(b, 10);
+            return h;
+        }
+    }
+
+    // ── functional interfaces ─────────────────────────────────────────
+    @FunctionalInterface
+    interface SortFunc   { byte    apply(AmtEntry e1, AmtEntry e2); }
+
+    @FunctionalInterface
+    interface FilterFunc { boolean apply(short idx, AmtEntry value,
+                                         Object arg1, Object arg2); }
+
+    // ── byte helpers ──────────────────────────────────────────────────
+    // little-endian read/write to match C behaviour
+    static int readInt(byte[] b, int off) {
+        return ((b[off]   & 0xff))       |
+               ((b[off+1] & 0xff) <<  8) |
+               ((b[off+2] & 0xff) << 16) |
+               ((b[off+3] & 0xff) << 24);
+    }
+
+    static short readShort(byte[] b, int off) {
+        return (short)(((b[off] & 0xff)) | ((b[off+1] & 0xff) << 8));
+    }
+
+    static void writeInt(byte[] b, int off, int v) {
+        b[off]   = (byte)(v);
+        b[off+1] = (byte)(v >>  8);
+        b[off+2] = (byte)(v >> 16);
+        b[off+3] = (byte)(v >> 24);
+    }
+
+    static void writeShort(byte[] b, int off, short v) {
+        b[off]   = (byte)(v);
+        b[off+1] = (byte)(v >> 8);
+    }
+
+    // ── CRC32 ─────────────────────────────────────────────────────────
+    static int crc32(byte[] data, int size) {
+        CRC32 c = new CRC32();
+        c.update(data, 0, size);
+        return (int) c.getValue();
+    }
+
+    // ── show ──────────────────────────────────────────────────────────
+    static void show(String id, AmtEntry e) {
+        System.out.printf("    %s={0x%08x,%d}%n", id, e.block, e.amt);
+    }
+
+    static void show(String id, AmtList list) {
+        if (list == null) return;
+        System.out.printf("  (amtlist*)%s = {%n", id);
+        System.out.printf("  capacity=%d%n", list.capacity);
+        System.out.printf("  length=%d%n",   list.length);
+        if (list.length > 0) {
+            int lim = Math.min(list.length, 6);
+            for (int n = 0; n < lim; n++) {
+                System.out.printf("    data [%d]= ", n);
+                show(id + "->data[n]", list.data[n]);
+            }
+            if (list.length > 5) System.out.println("   ...[])");
+        }
+    }
+
+    static void show(String id, BlockList list) {
+        if (list == null) return;
+        System.out.printf("  (blocklist*)%s = {%n", id);
+        System.out.printf("  length=%d%n", list.length);
+        if (list.length > 0) {
+            int lim = Math.min(list.length, 10);
+            for (int n = 0; n < lim; n++)
+                System.out.printf("   [%d]=%08x%n", n, list.blocks[n]);
+            if (list.length > 9) System.out.println("   ...[])");
+        }
+    }
+
+    // ── fail ──────────────────────────────────────────────────────────
+    static void fail(String fmt, Object... args) {
+        System.err.println(String.format(fmt, args));
+        System.exit(1);
+    }
+
+    // ── readfile ──────────────────────────────────────────────────────
+    static byte[] readfile(String path) {
+        File f = new File(path);
+        if (!f.exists())             fail("%s: No such file", path);
+        if (f.length() > Maxfilesz) fail("%s: File is too big", path);
+
+        Filesz = (int) f.length();
+        byte[] contents = new byte[Filesz + 4];
+
+        try (FileInputStream fis = new FileInputStream(f)) {
+            int off = 0, ret;
+            byte[] buf = new byte[512];
+            while ((ret = fis.read(buf)) > 0) {
+                System.arraycopy(buf, 0, contents, off, ret);
+                off += ret;
+            }
+        } catch (IOException e) { fail("%s: Unable to read file", path); }
+
+        return contents;
+    }
+
+    // ── readblock ─────────────────────────────────────────────────────
+    static AmtList readblock(byte[] contents, int size) {
+        if (contents == null || size == 0) return null;
+        AmtList list = new AmtList();
+
+        for (int p = 0; p <= size - 4; p += 4) {
+            int block = readInt(contents, p);
+            AmtEntry e = list.search(block);
+            if (e == null) list.add(new AmtEntry(block, 1));
+            else           e.amt++;
+        }
+        return list;
+    }
+
+    // ── sort ──────────────────────────────────────────────────────────
+    static byte amtsort(AmtEntry e1, AmtEntry e2) {
+        if (e1.amt > e2.amt)  return Morethan;
+        if (e1.amt == e2.amt) return Equal;
+        return LessThan;
+    }
+
+    static byte amtrevsort(AmtEntry e1, AmtEntry e2) {
+        if (e1.amt > e2.amt)  return LessThan;
+        if (e1.amt == e2.amt) return Equal;
+        return Morethan;
+    }
+
+    static void amtswap(AmtList list, int i, int j) {
+        if (list == null) return;
+        AmtEntry tmp = list.data[i];
+        list.data[i] = list.data[j];
+        list.data[j] = tmp;
+    }
+
+    static AmtList zipsort_(AmtList list, SortFunc func) {
+        if (func == null || list.length < 2) return null;
+        AmtList neu = list.copy();
+        if (neu == null) return null;
+
+        for (int n = 0; n < list.length - 1; n++) {
+            byte res = func.apply(neu.data[n], neu.data[n + 1]);
+            if (res == Morethan) {
+                AmtEntry tmp  = neu.data[n];
+                neu.data[n]   = neu.data[n + 1];
+                neu.data[n+1] = tmp;
+            }
+        }
+        boolean changed = !list.eq(neu);
+        return changed ? neu : null;
+    }
+
+    static AmtList zipsort(AmtList old, SortFunc func) {
+        if (old == null || func == null) return null;
+        AmtList neu = zipsort_(old, func);
+        if (neu == null) return old;
+        return zipsort(neu, func);
+    }
+
+    // ── filter ────────────────────────────────────────────────────────
+    static boolean head(short idx, AmtEntry v, Object a1, Object a2) {
+        if (v == null) return false;
+        return idx < (Integer) a2;
+    }
+
+    static boolean tail(short idx, AmtEntry v, Object a1, Object a2) {
+        if (v == null) return false;
+        return idx >= (Integer) a1;
+    }
+
+    static BlockList filterblocks(AmtList list, FilterFunc f,
+                                  Object arg1, Object arg2) {
+        if (list == null)     return null;
+        if (list.length == 0) return new BlockList(0);
+
+        BlockList p     = new BlockList(MaxFilter);
+        short     items = 0;
+
+        for (short n = 0; n < list.length && items < MaxFilter; n++)
+            if (f.apply(n, list.data[n], arg1, arg2))
+                p.blocks[items++] = list.data[n].block;
+
+        p.length = items;
+        p.blocks  = Arrays.copyOf(p.blocks, items);
+        return p;
+    }
+
+    // ── ENCODE ────────────────────────────────────────────────────────
+    // compresses contents[0..size] using dict, writes to outPath
+    // file layout:
+    //   [ZipHeader 14 bytes]
+    //   [dictionary: dictSize × 4 bytes]
+    //   [tokens: each block → 2-byte index OR 0xFFFF + 4-byte raw]
+    static void encode(byte[] contents, int size,
+                       Dictionary dict, String outPath) {
+
+        long crcVal = crc32(contents, size) & 0xFFFFFFFFL;
+
+        // build header
+        ZipHeader hdr = new ZipHeader();
+        hdr.magic    = Magic;
+        hdr.origSize = size;
+        hdr.dictSize = dict.size;
+        hdr.crc32    = (int) crcVal;
+
+        try (DataOutputStream out = new DataOutputStream(
+                new BufferedOutputStream(new FileOutputStream(outPath)))) {
+
+            // write header
+            out.write(hdr.toBytes());
+
+            // write dictionary — each entry is 4 bytes little-endian
+            byte[] tmp = new byte[4];
+            for (int i = 0; i < dict.size; i++) {
+                writeInt(tmp, 0, dict.blocks[i]);
+                out.write(tmp);
+            }
+
+            // encode each 4-byte block
+            int tokens = 0, saved = 0;
+            for (int p = 0; p <= size - 4; p += 4) {
+                int block = readInt(contents, p);
+                int idx   = dict.lookup(block);
+
+                if (idx >= 0) {
+                    // in dictionary — write 2-byte index
+                    writeShort(tmp, 0, (short) idx);
+                    out.write(tmp, 0, 2);
+                    saved += 2; // saved 2 bytes vs raw 4
+                } else {
+                    // not in dictionary — write 0xFFFF marker + raw 4 bytes
+                    writeShort(tmp, 0, RawMarker);
+                    out.write(tmp, 0, 2);
+                    writeInt(tmp, 0, block);
+                    out.write(tmp);
+                    saved -= 2; // cost 2 extra bytes vs raw 4
+                }
+                tokens++;
+            }
+
+            System.out.printf("encoded: %d blocks, saved %d bytes%n",
+                tokens, saved);
+            System.out.printf("original: %d bytes  compressed: %d bytes%n",
+                size,
+                ZipHeader.SIZE + (dict.size * 4) + (tokens * 2) +
+                    (int)((size/4 - tokens) * 6));
+
+        } catch (IOException e) { fail("%s: write error", outPath); }
+    }
+
+    // ── DECODE ────────────────────────────────────────────────────────
+    // reads a .zp2 file, reconstructs original, writes to outPath
+    static void decode(String inPath, String outPath) {
+        byte[] compressed;
+        try {
+            compressed = java.nio.file.Files.readAllBytes(
+                            java.nio.file.Paths.get(inPath));
+        } catch (IOException e) {
+            fail("%s: Unable to read", inPath); return;
+        }
+
+        if (compressed.length < ZipHeader.SIZE)
+            fail("%s: File too small to be a valid archive", inPath);
+
+        // read header
+        byte[] hdrBytes = Arrays.copyOf(compressed, ZipHeader.SIZE);
+        ZipHeader hdr   = ZipHeader.fromBytes(hdrBytes);
+
+        if (hdr.magic != Magic)
+            fail("%s: Not a valid zip2 archive", inPath);
+
+        System.out.printf("decoding: orig_size=%d dict_size=%d%n",
+            hdr.origSize, hdr.dictSize);
+
+        // read dictionary
+        int[] dict    = new int[hdr.dictSize & 0xFFFF];
+        int   dictOff = ZipHeader.SIZE;
+        for (int i = 0; i < dict.length; i++) {
+            dict[i] = readInt(compressed, dictOff);
+            dictOff += 4;
+        }
+
+        // decode tokens into output buffer
+        byte[] output = new byte[hdr.origSize + 4];
+        int    outOff = 0;
+        int    p      = dictOff;
+        byte[] tmp    = new byte[4];
+
+        while (p < compressed.length && outOff < hdr.origSize) {
+            short token = readShort(compressed, p);
+            p += 2;
+
+            if (token == RawMarker) {
+                // raw block — next 4 bytes are the actual value
+                int block = readInt(compressed, p);
+                p += 4;
+                writeInt(output, outOff, block);
+            } else {
+                // dictionary index
+                int idx = token & 0xFFFF;
+                if (idx >= dict.length)
+                    fail("corrupt archive: index %d out of range", idx);
+                writeInt(output, outOff, dict[idx]);
+            }
+            outOff += 4;
+        }
+
+        // verify CRC32
+        int gotCrc = crc32(output, hdr.origSize);
+        if (gotCrc != hdr.crc32)
+            fail("CRC32 mismatch: file is corrupt (got 0x%08x want 0x%08x)",
+                gotCrc, hdr.crc32);
+
+        // write output
+        try (FileOutputStream fos = new FileOutputStream(outPath)) {
+            fos.write(output, 0, hdr.origSize);
+        } catch (IOException e) { fail("%s: write error", outPath); }
+
+        System.out.printf("decoded: %d bytes → %s  [CRC32 OK]%n",
+            hdr.origSize, outPath);
+    }
+
+    // ── main3 — compress ──────────────────────────────────────────────
+    static int main3(String file) {
+        if (file == null) { fail("%s", "no file specified"); return 1; }
+
+        byte[]  contents = readfile(file);
+        AmtList list     = readblock(contents, Filesz);
+        if (list == null) { fail("%s", "Unable to read blocks"); return 1; }
+
+        show("list", list);
+
+        AmtList sorted = zipsort(list, Zip::amtrevsort);
+        if (sorted == null) { fail("%s: Unable to sort", file); return 1; }
+
+        BlockList blocks   = filterblocks(sorted, Zip::head, null, 4196);
+        BlockList listtail = filterblocks(sorted, Zip::tail,
+                                          (int) blocks.length, null);
+
+        if (blocks == null || listtail == null) {
+            fail("%s", "filterblocks() failure"); return 1;
+        }
+
+        show("sorted",   sorted);
+        show("blocks",   blocks);
+        show("listtail", listtail);
+
+        // build dictionary from common blocks
+        Dictionary dict = new Dictionary(blocks);
+
+        // encode to <file>.zp2
+        String outPath = file + ".zp2";
+        encode(contents, Filesz, dict, outPath);
+        System.out.println("compressed → " + outPath);
+
+        return 0;
+    }
+
+    // ── main1 ─────────────────────────────────────────────────────────
+    static int main1() {
+        AmtList list = new AmtList();
+        show("list", list);
+
+        for (int n = 0; n < 0x011000; n++)
+            list.add(new AmtEntry(0x10000000 + n, n));
+
+        amtswap(list, 1, 3);
+        show("list", list);
+
+        AmtList sorted = zipsort(list, Zip::amtsort);
+        show("sorted", sorted);
+        return 0;
+    }
+
+    // ── main2 ─────────────────────────────────────────────────────────
+    static int main2() {
+        AmtList list = new AmtList();
+        show("list", list);
+
+        for (int n = 0; n < 0x011000; n++)
+            list.add(new AmtEntry(0x10000000 + n, n));
+
+        AmtEntry e = list.search(0x10000000);
+        if (e != null) show("*e", e);
+        else           System.out.println("Not Found");
+        return 0;
+    }
+
+    // ── main ──────────────────────────────────────────────────────────
+    // usage:
+    //   java Zip <file>           compress → <file>.zp2
+    //   java Zip -d <file>.zp2   decompress → <file>
+    public static void main(String[] args) {
+        if (args.length < 1) {
+            System.err.println("USAGE: java Zip <file>");
+            System.err.println("       java Zip -d <file>.zp2");
+            System.exit(1);
+        }
+
+        if (args[0].equals("-d")) {
+            if (args.length < 2) {
+                System.err.println("USAGE: java Zip -d <file>.zp2");
+                System.exit(1);
+            }
+            String inPath  = args[1];
+            String outPath = inPath.endsWith(".zp2")
+                           ? inPath.substring(0, inPath.length() - 4)
+                           : inPath + ".out";
+            decode(inPath, outPath);
+        } else {
+            System.exit(main3(args[0]));
+        }
+    }
+}
